@@ -181,6 +181,23 @@ async def get_diagram(diagram_id: str):
     
     raise HTTPException(status_code=404, detail="Diagram not found")
 
+# New endpoint for uploading diagrams
+@app.post("/upload-diagram")
+async def upload_diagram(file: UploadFile = File(...)):
+    try:
+        # Get the filename and create the file path
+        filename = file.filename
+        file_path = os.path.join(DIAGRAMS_FOLDER, filename)
+        
+        # Save the file
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        return {"status": "success", "message": f"Diagram uploaded: {filename}", "path": file_path}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading diagram: {str(e)}")
+
 @app.post("/upload-processed-data")
 async def upload_processed_data(file: UploadFile = File(...)):
     # Create temp file
@@ -227,6 +244,11 @@ async def upload_processed_data(file: UploadFile = File(...)):
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=f"Error processing data: {str(e)}")
+
+# Root endpoint for health check
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "Diagram RAG Chatbot server is running"}
 
 if __name__ == "__main__":
     import uvicorn
