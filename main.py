@@ -1,17 +1,23 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import google.generativeai as genai
 import os
 import json
-import shutil
-import chromadb
-from chromadb.utils import embedding_functions
 import uuid
 from datetime import datetime
+from dotenv import load_dotenv
+from supabase import create_client, Client
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import io
 
+# Load environment variables
+load_dotenv()
+
+# Initialize API
 app = FastAPI(title="Diagram RAG Chatbot")
 
 # CORS middleware
@@ -24,33 +30,19 @@ app.add_middleware(
 )
 
 # Settings and configurations
-DIAGRAMS_FOLDER = "diagrams_store"
-VECTOR_DB_FOLDER = "vector_db"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-# Ensure storage directories exist
-os.makedirs(DIAGRAMS_FOLDER, exist_ok=True)
-os.makedirs(VECTOR_DB_FOLDER, exist_ok=True)
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 # Set up Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Setup ChromaDB
-def get_chroma_client():
-    client = chromadb.PersistentClient(path=VECTOR_DB_FOLDER)
-    
-    # Get embedding function
-    embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
-    )
-    
-    # Create or get collection
-    collection = client.get_or_create_collection(
-        name="diagram_descriptions",
-        embedding_function=embedding_function
-    )
-    
-    return collection
+# Initialize embedding model
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Initialize Supabase client
+def get_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Models
 class ChatRequest(BaseModel):
@@ -67,32 +59,70 @@ class ChatResponse(BaseModel):
     diagram_path: Optional[str] = None
     chat_id: str
 
+# Generate embeddings
+def generate_embedding(text: str) -> List[float]:
+    embedding = embedding_model.encode(text)
+    return embedding.tolist()
+
 # Search diagrams function
 def search_diagrams(query: str, top_k: int = 3):
     try:
-        collection = get_chroma_client()
+        supabase = get_supabase()
         
-        # Search for diagrams
-        results = collection.query(
-            query_texts=[query],
-            n_results=top_k
-        )
+        # Generate embedding for the query
+        query_embedding = generate_embedding(query)
         
-        # Format results
-        formatted_results = []
-        for i, doc_id in enumerate(results['ids'][0]):
-            formatted_results.append({
-                'diagram_path': results['metadatas'][0][i]['diagram_path'],
-                'description': results['documents'][0][i],
-                'source_pdf': results['metadatas'][0][i]['source_pdf'],
-                'page_number': results['metadatas'][0][i]['page_number'],
-                'relevance_score': results.get('distances', [[0]*len(results['ids'][0])])[0][i]
+        # SQL to search for similar diagrams using cosine similarity
+        sql = """
+        SELECT 
+            d.id, 
+            d.filename, 
+            d.description, 
+            d.source_pdf, 
+            d.page_number, 
+            d.storage_path,
+            1 - (e.embedding <=> ?) as similarity
+        FROM 
+            diagrams d
+        JOIN 
+            diagram_embeddings e ON d.id = e.diagram_id
+        ORDER BY 
+            similarity DESC
+        LIMIT ?
+        """
+        
+        # Execute query
+        response = supabase.table("diagram_embeddings").select(
+            "*, diagrams(id, filename, description, source_pdf, page_number, storage_path)"
+        ).execute()
+        
+        # Get storage URL for the bucket
+        bucket_url = f"{SUPABASE_URL}/storage/v1/object/public/diagrams"
+        
+        # Perform vector similarity search (we're doing this in Python since RPC may be more complex)
+        # In production, consider using a Supabase Edge Function or RPC
+        results = []
+        for item in response.data:
+            embedding = np.array(item['embedding'])
+            query_emb = np.array(query_embedding)
+            similarity = 1 - np.dot(embedding, query_emb) / (np.linalg.norm(embedding) * np.linalg.norm(query_emb))
+            
+            diagram = item['diagrams']
+            results.append({
+                'id': diagram['id'],
+                'diagram_path': f"{bucket_url}/{diagram['storage_path']}",
+                'description': diagram['description'],
+                'source_pdf': diagram['source_pdf'],
+                'page_number': diagram['page_number'],
+                'similarity': similarity
             })
         
-        return formatted_results
+        # Sort by similarity and take top_k
+        results.sort(key=lambda x: x['similarity'], reverse=True)
+        return results[:top_k]
     
     except Exception as e:
-        print(f"Error searching vector database: {e}")
+        print(f"Error searching diagrams: {e}")
         return []
 
 # Simple in-memory chat history (for production, use Redis or DB)
@@ -171,78 +201,102 @@ async def search_diagrams_endpoint(request: DiagramSearchRequest):
 
 @app.get("/diagram/{diagram_id}")
 async def get_diagram(diagram_id: str):
-    diagram_path = os.path.join(DIAGRAMS_FOLDER, diagram_id)
+    try:
+        supabase = get_supabase()
+        
+        # Get diagram details
+        response = supabase.table("diagrams").select("storage_path").eq("id", diagram_id).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Diagram not found")
+        
+        storage_path = response.data[0]["storage_path"]
+        
+        # Redirect to Supabase Storage
+        bucket_url = f"{SUPABASE_URL}/storage/v1/object/public/diagrams"
+        return RedirectResponse(f"{bucket_url}/{storage_path}")
     
-    # Check if file exists with different extensions
-    for ext in ['.png', '.jpg', '.jpeg', '.gif']:
-        full_path = f"{diagram_path}{ext}"
-        if os.path.exists(full_path):
-            return FileResponse(full_path)
-    
-    raise HTTPException(status_code=404, detail="Diagram not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving diagram: {str(e)}")
 
-# New endpoint for uploading diagrams
 @app.post("/upload-diagram")
 async def upload_diagram(file: UploadFile = File(...)):
     try:
-        # Get the filename and create the file path
-        filename = file.filename
-        file_path = os.path.join(DIAGRAMS_FOLDER, filename)
+        supabase = get_supabase()
         
-        # Save the file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Read file content
+        file_content = await file.read()
         
-        return {"status": "success", "message": f"Diagram uploaded: {filename}", "path": file_path}
+        # Generate a unique filename to avoid collisions
+        file_ext = os.path.splitext(file.filename)[1]
+        unique_filename = f"{uuid.uuid4()}{file_ext}"
+        
+        # Upload to Supabase Storage
+        supabase.storage.from_("diagrams").upload(
+            path=unique_filename,
+            file=file_content,
+            file_options={"content-type": file.content_type}
+        )
+        
+        # Return the path information
+        return {
+            "status": "success", 
+            "message": f"Diagram uploaded: {file.filename}", 
+            "storage_path": unique_filename,
+            "url": f"{SUPABASE_URL}/storage/v1/object/public/diagrams/{unique_filename}"
+        }
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error uploading diagram: {str(e)}")
 
 @app.post("/upload-processed-data")
 async def upload_processed_data(file: UploadFile = File(...)):
-    # Create temp file
-    temp_file_path = f"temp_{uuid.uuid4()}.json"
-    with open(temp_file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    # Read json data
     try:
-        with open(temp_file_path, "r") as f:
-            data = json.load(f)
+        # Read JSON data
+        content = await file.read()
+        data = json.loads(content.decode('utf-8'))
         
-        # Process and store in ChromaDB
-        collection = get_chroma_client()
+        supabase = get_supabase()
         
-        ids = []
-        documents = []
-        metadatas = []
-        
+        # Process and store in Supabase
+        success_count = 0
         for item in data:
-            ids.append(item["id"])
-            documents.append(item["description"])
-            metadatas.append({
-                "source_pdf": item["source_pdf"],
-                "page_number": str(item["page_number"]), 
-                "diagram_path": item["diagram_path"],
-                "source_page": f"{item['source_pdf']} - Page {item['page_number']}"
-            })
+            try:
+                # Extract filename from diagram_path
+                filename = os.path.basename(item["diagram_path"])
+                
+                # Insert diagram metadata
+                response = supabase.table("diagrams").insert({
+                    "filename": filename,
+                    "description": item["description"],
+                    "source_pdf": item["source_pdf"],
+                    "page_number": item["page_number"],
+                    "storage_path": filename  # assuming the file will be uploaded with the same name
+                }).execute()
+                
+                if not response.data:
+                    continue
+                
+                # Get the diagram ID
+                diagram_id = response.data[0]["id"]
+                
+                # Generate embedding for the description
+                embedding = generate_embedding(item["description"])
+                
+                # Store embedding
+                supabase.table("diagram_embeddings").insert({
+                    "diagram_id": diagram_id,
+                    "embedding": embedding
+                }).execute()
+                
+                success_count += 1
+            
+            except Exception as e:
+                print(f"Error processing item {item.get('id', 'unknown')}: {e}")
         
-        # Add to collection
-        collection.add(
-            ids=ids,
-            documents=documents,
-            metadatas=metadatas
-        )
-        
-        # Clean up
-        os.remove(temp_file_path)
-        
-        return {"status": "success", "message": f"Processed {len(ids)} diagram entries"}
+        return {"status": "success", "message": f"Processed {success_count} out of {len(data)} diagram entries"}
     
     except Exception as e:
-        # Clean up on error
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=f"Error processing data: {str(e)}")
 
 # Root endpoint for health check
