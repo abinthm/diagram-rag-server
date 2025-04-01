@@ -3,13 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
+import google.generativeai as genai
 import os
 import uuid
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
 import numpy as np
-import anthropic
 
 # Load environment variables
 load_dotenv()
@@ -27,14 +27,12 @@ app.add_middleware(
 )
 
 # Settings and configurations
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-CLAUDE_MODEL = "claude-3-7-sonnet-20250219"  # Latest model as of March 2025
 
-# Initialize Claude client
-def get_claude_client():
-    return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# Set up Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
 # Initialize embedding model
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -53,15 +51,12 @@ class ChatResponse(BaseModel):
     diagram_path: Optional[str] = None
     session_id: str
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
 # Generate embeddings for vector search
 def generate_embedding(text: str) -> List[float]:
     embedding = embedding_model.encode(text)
     return embedding.tolist()
 
+# Search diagrams function
 # Search diagrams function
 def search_diagrams(query: str, top_k: int = 1):
     try:
@@ -148,8 +143,8 @@ async def chat_endpoint(request: ChatRequest):
         # Get chat history
         history = chat_sessions[session_id]
         
-        # Initialize Claude client
-        client = get_claude_client()
+        # Initialize Gemini model
+        model = genai.GenerativeModel(model_name="gemini-1.5-pro")
         
         # Determine if the query might need a diagram
         needs_diagram_prompt = f"""
@@ -159,21 +154,13 @@ async def chat_endpoint(request: ChatRequest):
         or visual representation to properly explain the concept? Answer with YES or NO only.
         """
         
-        needs_diagram_response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=10,
-            messages=[
-                {"role": "user", "content": needs_diagram_prompt}
-            ]
-        )
-        
-        needs_diagram_result = needs_diagram_response.content[0].text
+        needs_diagram_response = model.generate_content(needs_diagram_prompt).text.strip()
         
         # Search for relevant diagrams if needed
         retrieved_context = ""
         diagram_path = None
         
-        if "YES" in needs_diagram_result.upper():
+        if "YES" in needs_diagram_response.upper():
             diagram_results = search_diagrams(request.prompt)
             
             if diagram_results and diagram_results[0]['similarity'] > 0.6:
@@ -189,61 +176,34 @@ async def chat_endpoint(request: ChatRequest):
                 Please refer to the attached diagram while reading my explanation.
                 """
         
-        # Format chat history for Claude API
-        formatted_history = []
+        # Start chat with history
+        chat = model.start_chat(history=history)
         
-        # Add previous messages from history
-        for msg in history:
-            formatted_history.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-        
-        # System instructions
-        system_message = """
+        # Add system instructions to the user message instead
+        system_instructions = """
         You are an educational assistant that helps explain concepts clearly.
         When diagrams are available, refer to them in your explanation to enhance understanding.
         Keep explanations clear, concise, and tailored to educational purposes.
         """
         
-        # Construct user message with retrieved diagram info
+        # Construct prompt with system instructions and retrieved diagram info
         user_message = f"""
+        {system_instructions}
+        
         User query: {request.prompt}
         
         {retrieved_context if retrieved_context else ""}
         """
         
-        # Create the request to Claude API
-        if formatted_history:
-            # Add the new message to existing conversation
-            formatted_history.append({"role": "user", "content": user_message})
-            response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=1024,
-                system=system_message,
-                messages=formatted_history
-            )
-        else:
-            # First message in conversation
-            response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=1024,
-                system=system_message,
-                messages=[{"role": "user", "content": user_message}]
-            )
+        # Get response
+        response = chat.send_message(user_message)
         
-        # Extract response text
-        response_text = response.content[0].text
-        
-        # Update chat history with the new messages
-        chat_sessions[session_id] = [
-            *formatted_history,
-            {"role": "assistant", "content": response_text}
-        ]
+        # Update chat history
+        chat_sessions[session_id] = chat.history
         
         # Prepare response
         return ChatResponse(
-            response=response_text,
+            response=response.text,
             diagram_path=diagram_path,
             session_id=session_id
         )
@@ -251,7 +211,6 @@ async def chat_endpoint(request: ChatRequest):
     except Exception as e:
         print(f"Error in chat endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
-
 # Root endpoint for health check
 @app.get("/")
 async def root():
